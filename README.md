@@ -13,7 +13,6 @@ $ev->connect('localhost:11211', function($events, $arg = NULL) use($ev) {
             var_dump($value);
         });
     }
-}
 });
 
 $eb->dispatch();
