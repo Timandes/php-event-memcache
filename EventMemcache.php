@@ -38,6 +38,13 @@ class EventMemcache
     public function __construct(EventBase $base)
     {
         $this->_base = $base;
+        $this->initializeEvent($base);
+        $this->_reader = new EventMemcacheStreamReader();
+        $this->_parser = new EventMemcacheResponseParser();
+    }
+
+    private function initializeEvent($base)
+    {
         $this->_event = new EventBufferEvent($base, NULL
             , EventBufferEvent::OPT_CLOSE_ON_FREE | EventBufferEvent::OPT_DEFER_CALLBACKS
             , array($this, 'onDataArrived')
@@ -45,8 +52,13 @@ class EventMemcache
             , array($this, 'onStatusChanged')
             , $this);
         $this->_event->enable(Event::READ | Event::WRITE);
-        $this->_reader = new EventMemcacheStreamReader();
-        $this->_parser = new EventMemcacheResponseParser();
+    }
+
+    private function destroyEvent()
+    {
+        $this->_event->disable(Event::READ | Event::WRITE);
+        $this->_event->free();
+        $this->_event = null;
     }
 
     public function onDataArrived(EventBufferEvent $bev, $arg)
@@ -76,8 +88,14 @@ class EventMemcache
     {
         if ($events & EventBufferEvent::CONNECTED)
             $this->_connected = true;
-        else
+        else {
+            if ($events & EventBufferEvent::ERROR) {
+                $this->destroyEvent();
+                $this->initializeEvent($this->_base);
+            }
+
             $this->_connected = false;
+        }
 
         if (is_callable($this->_callback4Connecting)) {
             call_user_func($this->_callback4Connecting, $events, $this->_arg4Connecting);
@@ -126,6 +144,7 @@ class EventMemcache
      */
     public function close()
     {
+        $this->_connected = false;
         $this->_event->close();
     }
 
@@ -135,6 +154,11 @@ class EventMemcache
     public function connected()
     {
         return $this->_connected;
+    }
+
+    public function free()
+    {
+        $this->destroyEvent();
     }
 }
 
