@@ -5,10 +5,14 @@
  * @author Timandes White <timands@gmail.com>
  */
 
+use \Psr\Log\LoggerInterface;
+use \Psr\Log\LoggerAwareInterface;
+use \Psr\Log\NullLogger;
+
 /**
  * Async interface for memcache protocol
  */
-class EventMemcache
+class EventMemcache implements LoggerAwareInterface
 {
     /** @var EventBase Event base */
     private $_base = null;
@@ -30,6 +34,13 @@ class EventMemcache
     /** @var bool Is still connected? */
     private $_connected = false;
 
+    protected $_logger = null;
+
+    /** @var callback */
+    private $_callback4Error = null;
+    /** @var mixed */
+    private $_arg4Error = null;
+
     /**
      * Constructor
      *
@@ -37,10 +48,16 @@ class EventMemcache
      */
     public function __construct(EventBase $base)
     {
+        $this->_logger = new NullLogger();
         $this->_base = $base;
         $this->initializeEvent($base);
         $this->_reader = new EventMemcacheStreamReader();
         $this->_parser = new EventMemcacheResponseParser();
+    }
+
+    public function __destruct()
+    {
+        $this->_logger->debug("EventMemcache::__destruct()");
     }
 
     private function initializeEvent($base)
@@ -63,11 +80,28 @@ class EventMemcache
 
     public function onDataArrived(EventBufferEvent $bev, $arg)
     {
+        try {
+            $this->dataArrivedCompletion($bev, $arg);
+        } catch (Exception $e) {
+            $code = $e->getCode();
+            $message = $e->getMessage();
+            $this->_logger->error("Exception(#{$code}): {$message}");
+        }
+    }
+
+    protected function dataArrivedCompletion(EventBufferEvent $bev, $arg)
+    {
         $input = $this->_event->getInput();
         $r = $this->_reader->read($input);
         if ($r) {
+            $this->_logger->debug("EventMemcache: Got response from mc: " . serialize($this->_reader->getResponse()));
+
             $values = $this->_parser->parse($this->_reader);
+            $this->_logger->debug("EventMemcache: Got values from mc: " . serialize($values));
+
             $this->_reader->clear();
+
+            $this->_logger->debug("EventMemcache: Callbacks: " . count($this->_callbacks));
 
             $meta = array_shift($this->_callbacks);
             if (is_callable($meta['cb'])) {
@@ -76,7 +110,8 @@ class EventMemcache
                 else
                     call_user_func($meta['cb'], $meta['key'], false, $meta['arg']);
             }
-        }
+        } else
+            throw RuntimeException("Fail to read from input");
     }
 
     public function onDataSending(EventBufferEvent $bev, $arg)
@@ -86,15 +121,20 @@ class EventMemcache
 
     public function onStatusChanged(EventBufferEvent $bev, $events, $arg)
     {
+        $this->_logger->debug("EventMemcache: onStatusChanged: events=" . $events);
+
         if ($events & EventBufferEvent::CONNECTED)
             $this->_connected = true;
         else {
             if ($events & EventBufferEvent::ERROR) {
+                $this->_logger->error("EventMemcache: Got error, trying to re-create the event object");
                 $this->destroyEvent();
                 $this->initializeEvent($this->_base);
             }
-
             $this->_connected = false;
+
+            if (is_callable($this->_callback4Error))
+                call_user_func($this->_callback4Error, $events, $this->_arg4Error);
         }
 
         if (is_callable($this->_callback4Connecting)) {
@@ -133,7 +173,8 @@ class EventMemcache
                 'cb' => $cb,
                 'arg' => $arg,
             );
-        
+        $this->_logger->debug("EventMemcache: Callbacks: " . count($this->_callbacks));
+
         $cmd = 'get ' . $key . "\n";
         $output = $this->_event->getOutput();
         $output->add($cmd);
@@ -156,22 +197,49 @@ class EventMemcache
         return $this->_connected;
     }
 
+    public function setLogger(LoggerInterface $logger)
+    {
+        $this->_logger = $logger;
+        $this->_reader->setLogger($logger);
+    }
+
     public function free()
     {
         $this->destroyEvent();
+    }
+
+    /**
+     * Set error handler which will be triggered when error occurs after connection established
+     *
+     * @param callable $cb Callback.
+     * @param mixed $arg User custom data. 
+     */
+    public function setErrorHandler(callable $cb, $arg = NULL)
+    {
+        $this->_callback4Error = $cb;
+        $this->_arg4Error = $arg;
     }
 }
 
 /**
  * Stream reader
  */
-class EventMemcacheStreamReader
+class EventMemcacheStreamReader implements LoggerAwareInterface
 {
     private $_response = '';
+
+    protected $_logger = null;
+
+    public function __construct()
+    {
+        $this->_logger = new NullLogger();
+    }
 
     public function read(EventBuffer $buffer)
     {
         while (NULL !== ($line = $buffer->readLine(EventBuffer::EOL_CRLF_STRICT))) {
+            $this->_logger->debug("EventMemcacheStreamReader: Line from buffer(serialized): " . serialize($line));
+
             $fields = explode(' ', trim($line));
             switch ($fields[0]) {
                 case 'END':
@@ -193,6 +261,11 @@ class EventMemcacheStreamReader
     public function getResponse()
     {
         return $this->_response;
+    }
+
+    public function setLogger(LoggerInterface $logger)
+    {
+        $this->_logger = $logger;
     }
 }
 
@@ -218,6 +291,8 @@ class EventMemcacheResponseParser
             return unserialize(gzuncompress($value));
         elseif ($flags == 4)
             return unserialize($value);
+        elseif ($flags == 5)
+            return igbinary_unserialize($value);
         else
             throw new RuntimeException("Unknown flags $flags");
     }
